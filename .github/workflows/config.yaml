@@ -1,0 +1,143 @@
+name: Cypress Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  build:
+   runs-on: ubuntu-latest
+   container:
+     image: mudith215/spartify-builder:1.2
+   steps:
+     - name: Checkout code
+       uses: actions/checkout@v4
+
+     - name: Cache dependencies
+       uses: actions/cache@v4
+       with:
+         path: |
+           ~/.npm
+           node_modules
+         key: build-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+     - name: Install dependencies
+       env:
+        SPARTIFY_KEY: ${{ secrets.SPARTIFY_KEY }}
+       run: npm run initialize --legacy-peer-deps --omit=optional
+
+     - name: Upload workspace
+       uses: actions/upload-artifact@v4
+       with:
+         name: workspace
+         path: |
+           ~/.npm
+           node_modules
+  run-tests:
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        shard: [0, 1]
+    container: cypress/browsers:node-20.17.0-chrome-128.0.6613.119-1-ff-130.0-edge-128.0.2739.63-1
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Restore Workspace Cache
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace
+          path: ~/.npm
+
+      - name: Run Cypress Tests
+        uses: cypress-io/github-action@v5
+        with:
+          config-file: spartify.config.ts
+          install-command: npm run initialize
+          command: npm run sp:run:test
+ 
+        env:
+          SPLIT: ${{ strategy.job-total }}
+          SPLIT_INDEX: ${{ strategy.job-index }}
+          SPARTIFY_KEY: ${{ secrets.SPARTIFY_KEY }}
+        continue-on-error: true
+
+      - name: Create report directories
+        run: |
+          mkdir -p spartify-report/report
+          mkdir -p spartify-report/report-${{ strategy.job-index }}
+
+      - name: Rename report files (Make unique)
+        if: always()
+        run: |
+          if [ -d "spartify-report/report" ] && [ "$(ls -A spartify-report/report)" ]; then
+            mv spartify-report/report/* spartify-report/report-${{ strategy.job-index }}/ || true
+          fi
+          touch spartify-report/report-${{ strategy.job-index }}/.keep
+
+      - name: Upload Cypress Test Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cypress-report-${{ strategy.job-index }}
+          path: spartify-report/report-${{ strategy.job-index }}
+          if-no-files-found: warn
+
+  merge-reports:
+    runs-on: ubuntu-latest
+    needs: run-tests
+    container: node:20-alpine
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Test Reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cypress-report-*
+          path: spartify-report/
+          merge-multiple: true
+
+      - name: Merge Cypress Reports
+        run: |
+          mkdir -p spartify-report/merged
+          if ls spartify-report/*.json 1>/dev/null 2>&1; then
+            echo "Merging reports..."
+            npx mochawesome-merge "spartify-report/*.json" > spartify-report/merged/report.json
+          else
+            echo '{"stats":{"suites":0,"tests":0,"passes":0,"pending":0,"failures":0},"results":[]}' > spartify-report/merged/report.json
+          fi
+      - name: Upload Merged Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-cypress-reports
+          path: spartify-report/merged/
+
+  upload-report:
+    runs-on: ubuntu-latest
+    needs: merge-reports
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install curl
+        run: apk add --no-cache curl
+      - name: Download Merged Report
+        uses: actions/download-artifact@v4
+        with:
+          name: merged-cypress-reports
+          path: spartify-report/merged/
+    
+      - name: Upload Merged Report to API
+        run: |
+          API_URL="https://dev-portal.spartify.io/reports/test-execution-analysis/submit"
+          PROJECT_ID="${{ secrets.PROJECT_ID }}"
+          BUILD_ID="$GITHUB_RUN_ID"
+          API_KEY="${{ secrets.SPARTIFY_KEY }}"
+          REPORT_PATH="spartify-report/merged/report.json"
+          curl --location --verbose "$API_URL/$PROJECT_ID/$BUILD_ID" \
+           --header "API-KEY: ${API_KEY}" \
+           --form "file=@$REPORT_PATH"
+ 
